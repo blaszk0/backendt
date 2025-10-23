@@ -492,10 +492,15 @@ app.get("/health", (req, res) => {
 });
 
 server.listen(PORT, () => {
+  const renderUrl =
+    process.env.RENDER_EXTERNAL_URL || "https://backendt-isi3.onrender.com";
+  const wsUrl = renderUrl.replace("https://", "wss://");
+
   console.log(`🚀 Servidor WebSocket corriendo en puerto ${PORT}`);
-  console.log(`📡 Conectar Unity a: wss://fresh-baboons-work.loca.lt`);
-  console.log(`🏥 Health check: https://fresh-baboons-work.loca.lt/health`);
+  console.log(`📡 Conectar Unity a: ${wsUrl}`);
+  console.log(`🏥 Health check: ${renderUrl}/health`);
 });
+
 
 process.on("SIGINT", () => {
   console.log("\n🛑 Cerrando servidor...");
