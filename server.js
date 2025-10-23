@@ -476,6 +476,7 @@ wss.on("connection", async (clientWs) => {
 });
 
 // Endpoint de salud con info detallada de historial
+// Endpoint de salud con info detallada de historial
 app.get("/health", (req, res) => {
   const connectionsInfo = [];
   clientConnections.forEach((conn) => {
@@ -496,10 +497,15 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     connections: clientConnections.size,
-    connectionsInfo: connectionsInfo,
+    connectionsInfo,
     uptime: Math.round(process.uptime()) + "s",
     memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB",
   });
+});
+
+// ✅ NUEVO ENDPOINT raíz
+app.get("/", (req, res) => {
+  res.status(200).send("🟢 Servidor activo y listo para WebSocket");
 });
 
 server.listen(PORT, () => {
