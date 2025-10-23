@@ -1,6 +1,7 @@
 const express = require("express");
 const WebSocket = require("ws");
 const http = require("http");
+const cors = require("cors");
 const { GoogleAuth } = require("google-auth-library");
 const path = require("path");
 require("dotenv").config();
@@ -12,8 +13,18 @@ process.env.GOOGLE_APPLICATION_CREDENTIALS = path.join(
 );
 
 const app = express();
+app.use(cors()); // ✅ habilitar CORS para Render y Unity
+
+// --- NUEVO BLOQUE --- habilita “upgrade” explícitamente
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ noServer: true }); // 👈 noServer
+
+server.on("upgrade", (request, socket, head) => {
+  console.log("🔁 Solicitud de upgrade recibida (WebSocket)");
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit("connection", ws, request);
+  });
+});
 
 const MODEL = "gemini-2.5-flash-native-audio-preview-09-2025";
 const PORT = process.env.PORT || 3000;
@@ -500,7 +511,6 @@ server.listen(PORT, () => {
   console.log(`📡 Conectar Unity a: ${wsUrl}`);
   console.log(`🏥 Health check: ${renderUrl}/health`);
 });
-
 
 process.on("SIGINT", () => {
   console.log("\n🛑 Cerrando servidor...");
