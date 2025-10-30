@@ -15,12 +15,12 @@ process.env.GOOGLE_APPLICATION_CREDENTIALS = path.join(
 const app = express();
 app.use(cors()); // ✅ habilitar CORS para Render y Unity
 
-// --- NUEVO BLOQUE --- habilita “upgrade” explícitamente
+// --- NUEVO BLOQUE --- habilita "upgrade" explícitamente
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true }); // 👈 noServer
 
 server.on("upgrade", (request, socket, head) => {
-  console.log("🔁 Solicitud de upgrade recibida (WebSocket)");
+  console.log("🔍 Solicitud de upgrade recibida (WebSocket)");
   wss.handleUpgrade(request, socket, head, (ws) => {
     wss.emit("connection", ws, request);
   });
@@ -130,7 +130,10 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
     reconnectCount: existingConnection
       ? existingConnection.reconnectCount + 1
       : 0,
-    audioBuffers: [], // Buffers de audio del usuario
+    audioBuffers: [],
+    currentVoice: existingConnection
+      ? existingConnection.currentVoice
+      : "Zephyr", // 🎵 Mantener voz actual
   };
 
   clientConnections.set(clientWs, connectionData);
@@ -140,6 +143,9 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
     console.log(
       `🔗 Conectado a Gemini API (reconexión #${connectionData.reconnectCount})`
     );
+
+    // 🎵 Obtener voz actual (por defecto "Zephyr")
+    const currentVoice = connectionData.currentVoice || "Zephyr";
 
     // Construir system instruction con historial
     const historyContext = buildConversationHistory(conversationLog);
@@ -155,7 +161,7 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
           response_modalities: ["AUDIO"],
           speech_config: {
             voice_config: {
-              prebuilt_voice_config: { voice_name: "Zephyr" },
+              prebuilt_voice_config: { voice_name: currentVoice }, // 🎵 Usar voz actual
             },
           },
         },
@@ -170,6 +176,7 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
     };
 
     geminiWs.send(JSON.stringify(setupMessage));
+    console.log(`🎵 Voz configurada: ${currentVoice}`);
 
     if (conversationLog.length > 0) {
       console.log(
@@ -219,6 +226,7 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
           type: "ready",
           historyRestored: conversationLog.length > 0,
           reconnectCount: connectionData.reconnectCount,
+          currentVoice: currentVoice, // 🎵 Informar voz actual
         })
       );
     }
@@ -295,14 +303,6 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
               );
             }
           }
-        }
-
-        // Intentar capturar transcripción del usuario si viene en el mensaje
-        if (
-          message.serverContent.interrupted ||
-          message.serverContent.grounding
-        ) {
-          // Algunos mensajes pueden contener info del usuario
         }
       }
 
@@ -432,6 +432,32 @@ wss.on("connection", async (clientWs) => {
         if (geminiWs.readyState === WebSocket.OPEN) {
           geminiWs.send(JSON.stringify({ interrupt: {} }));
         }
+      } else if (data.type === "change_voice") {
+        // 🎵 NUEVO: Manejar cambio de voz
+        const newVoice = data.voice;
+        if (newVoice) {
+          console.log(`🎵 Solicitud de cambio de voz a: ${newVoice}`);
+          connection.currentVoice = newVoice;
+
+          // Forzar reconexión con la nueva voz
+          if (geminiWs.readyState === WebSocket.OPEN) {
+            console.log(
+              `🎵 Cerrando conexión actual para aplicar nueva voz...`
+            );
+            geminiWs.close(1000, "Voice change requested");
+          }
+
+          // Enviar confirmación al cliente
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(
+              JSON.stringify({
+                type: "voice_changed",
+                voice: newVoice,
+                message: `Cambiando voz a ${newVoice}...`,
+              })
+            );
+          }
+        }
       } else if (data.type === "clear_history") {
         connection.conversationLog = [];
         connection.currentUserText = "";
@@ -476,7 +502,6 @@ wss.on("connection", async (clientWs) => {
 });
 
 // Endpoint de salud con info detallada de historial
-// Endpoint de salud con info detallada de historial
 app.get("/health", (req, res) => {
   const connectionsInfo = [];
   clientConnections.forEach((conn) => {
@@ -488,6 +513,7 @@ app.get("/health", (req, res) => {
       messagesInHistory: conn.conversationLog.length,
       historySizeChars: historySize,
       reconnectCount: conn.reconnectCount,
+      currentVoice: conn.currentVoice, // 🎵 Mostrar voz actual
       lastPong: new Date(conn.lastPong).toISOString(),
       timeSinceLastPong: Math.round((Date.now() - conn.lastPong) / 1000) + "s",
       geminiConnected: conn.gemini?.readyState === WebSocket.OPEN,
@@ -515,7 +541,7 @@ server.listen(PORT, () => {
 
   console.log(`🚀 Servidor WebSocket corriendo en puerto ${PORT}`);
   console.log(`📡 Conectar Unity a: ${wsUrl}`);
-  console.log(`🏥 Health check: ${renderUrl}/health`);
+  console.log(`🩺 Health check: ${renderUrl}/health`);
 });
 
 process.on("SIGINT", () => {
