@@ -6,21 +6,19 @@ const { GoogleAuth } = require("google-auth-library");
 const path = require("path");
 require("dotenv").config();
 
-// Configurar ruta a credentials.json
 process.env.GOOGLE_APPLICATION_CREDENTIALS = path.join(
   __dirname,
   "credentials.json"
 );
 
 const app = express();
-app.use(cors()); // ✅ habilitar CORS para Render y Unity
+app.use(cors());
 
-// --- NUEVO BLOQUE --- habilita "upgrade" explícitamente
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ noServer: true }); // 👈 noServer
+const wss = new WebSocket.Server({ noServer: true });
 
 server.on("upgrade", (request, socket, head) => {
-  console.log("🔍 Solicitud de upgrade recibida (WebSocket)");
+  console.log("🔌 Solicitud de upgrade recibida (WebSocket)");
   wss.handleUpgrade(request, socket, head, (ws) => {
     wss.emit("connection", ws, request);
   });
@@ -28,13 +26,31 @@ server.on("upgrade", (request, socket, head) => {
 
 const MODEL = "gemini-2.5-flash-native-audio-preview-09-2025";
 const PORT = process.env.PORT || 3000;
-const PING_INTERVAL = 20000; // Ping cada 20 segundos (más agresivo)
-const PONG_TIMEOUT = 45000; // 45 segundos sin pong = reconectar
 
-// Almacenar conexiones cliente-Gemini con historial
+// ⚙️ CONFIGURACIÓN OPTIMIZADA PARA SESIONES ILIMITADAS
+const PING_INTERVAL = 30000; // Ping cada 30s (keepalive suave)
+const CONNECTION_REFRESH_TIME = 540000; // 9 minutos (antes de los 10 min de límite)
+const PONG_TIMEOUT = 90000; // 90s sin pong = problema real
+const MAX_RECONNECT_ATTEMPTS = 5; // Más intentos para casos extremos
+const RECONNECT_DELAY = 2000; // 2 segundos (respuesta rápida)
+
 const clientConnections = new Map();
 
-// Función para obtener token efímero
+// 🆕 Helper para códigos de cierre
+function getCloseCodeInfo(code) {
+  const codes = {
+    1000: "Normal",
+    1001: "Going Away",
+    1002: "Protocol Error",
+    1003: "Unsupported Data",
+    1006: "Abnormal Closure",
+    1008: "Policy Violation",
+    1011: "Server Error",
+    1015: "TLS Handshake",
+  };
+  return codes[code] || "Unknown";
+}
+
 async function getEphemeralToken() {
   try {
     const auth = new GoogleAuth({
@@ -56,7 +72,6 @@ async function getEphemeralToken() {
   }
 }
 
-// Función para crear conexión con Gemini
 async function createGeminiConnection(useEphemeralToken = true) {
   let geminiUrl;
   let geminiWs;
@@ -76,7 +91,6 @@ async function createGeminiConnection(useEphemeralToken = true) {
     }
   }
 
-  // Fallback a API Key
   const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
   if (!GEMINI_API_KEY) {
     throw new Error("No hay GEMINI_API_KEY ni credentials.json válidos");
@@ -87,7 +101,6 @@ async function createGeminiConnection(useEphemeralToken = true) {
   return new WebSocket(geminiUrl);
 }
 
-// Construir historial de conversación como texto
 function buildConversationHistory(conversationLog) {
   if (conversationLog.length === 0) return "";
 
@@ -108,11 +121,15 @@ function buildConversationHistory(conversationLog) {
   return history;
 }
 
-// Función para reconectar Gemini automáticamente
-async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
+// 🆕 FUNCIÓN MEJORADA CON SESSION RESUMPTION
+async function setupGeminiConnection(
+  clientWs,
+  useEphemeralToken = true,
+  reason = "initial",
+  resumptionHandle = null
+) {
   const geminiWs = await createGeminiConnection(useEphemeralToken);
 
-  // Obtener conexión existente para mantener historial
   let existingConnection = clientConnections.get(clientWs);
   let conversationLog = existingConnection
     ? existingConnection.conversationLog
@@ -123,6 +140,7 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
     reconnectTimeout: null,
     conversationLog: conversationLog,
     pingInterval: null,
+    connectionRefreshTimer: null, // 🆕 Timer para refresh proactivo
     lastPong: Date.now(),
     lastPing: Date.now(),
     currentUserText: "",
@@ -133,27 +151,36 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
     audioBuffers: [],
     currentVoice: existingConnection
       ? existingConnection.currentVoice
-      : "Zephyr", // 🎵 Mantener voz actual
+      : "Zephyr",
+    sessionStartTime: existingConnection
+      ? existingConnection.sessionStartTime
+      : Date.now(),
+    connectionStartTime: Date.now(), // 🆕 Tiempo de esta conexión específica
+    shouldReconnect: true,
+    lastActivity: Date.now(),
+    resumptionHandle: resumptionHandle || existingConnection?.resumptionHandle, // 🆕 Handle de reanudación
+    isVoiceChanging: false, // 🆕 Flag para cambio de voz
   };
 
   clientConnections.set(clientWs, connectionData);
 
-  // Cuando Gemini se conecta, enviar setup
   geminiWs.on("open", () => {
+    const sessionDuration = Date.now() - connectionData.sessionStartTime;
+    const resumeInfo = resumptionHandle ? " (resumiendo sesión)" : "";
     console.log(
-      `🔗 Conectado a Gemini API (reconexión #${connectionData.reconnectCount})`
+      `🔗 Conectado a Gemini API (${reason}, conexión #${
+        connectionData.reconnectCount
+      }, sesión total: ${Math.round(sessionDuration / 1000)}s)${resumeInfo}`
     );
 
-    // 🎵 Obtener voz actual (por defecto "Zephyr")
     const currentVoice = connectionData.currentVoice || "Zephyr";
-
-    // Construir system instruction con historial
     const historyContext = buildConversationHistory(conversationLog);
     const systemText =
       "Eres un asistente amigable que responde en español de forma clara y concisa. " +
       "Mantén coherencia con el historial de conversación y evita repetir información ya discutida." +
       historyContext;
 
+    // 🆕 CONFIGURACIÓN CON SESSION RESUMPTION Y CONTEXT COMPRESSION
     const setupMessage = {
       setup: {
         model: `models/${MODEL}`,
@@ -161,63 +188,81 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
           response_modalities: ["AUDIO"],
           speech_config: {
             voice_config: {
-              prebuilt_voice_config: { voice_name: currentVoice }, // 🎵 Usar voz actual
+              prebuilt_voice_config: { voice_name: currentVoice },
             },
           },
         },
         system_instruction: {
-          parts: [
-            {
-              text: systemText,
-            },
-          ],
+          parts: [{ text: systemText }],
+        },
+        // 🆕 Habilitar Session Resumption para sesiones ilimitadas
+        session_resumption: resumptionHandle
+          ? { handle: resumptionHandle }
+          : {},
+        // 🆕 Habilitar Context Window Compression para evitar límite de 15 min
+        context_window_compression: {
+          sliding_window: {},
+          trigger_tokens: 30000, // Comprimir cuando se acerque al límite
         },
       },
     };
 
     geminiWs.send(JSON.stringify(setupMessage));
-    console.log(`🎵 Voz configurada: ${currentVoice}`);
+    console.log(
+      `🎵 Voz: ${currentVoice} | 🔄 Session Resumption: ✓ | 🗜️ Compression: ✓`
+    );
 
     if (conversationLog.length > 0) {
       console.log(
-        `📜 Contexto restaurado: ${
+        `📜 Contexto: ${
           conversationLog.length
         } mensajes (${conversationLog.reduce(
           (acc, msg) => acc + msg.text.length,
           0
-        )} caracteres)`
+        )} chars)`
       );
     }
 
-    // Configurar keep-alive con ping/pong más agresivo
     const connection = clientConnections.get(clientWs);
     if (connection) {
+      // Limpiar timers anteriores
+      if (connection.pingInterval) clearInterval(connection.pingInterval);
+      if (connection.connectionRefreshTimer)
+        clearTimeout(connection.connectionRefreshTimer);
+
+      // 🆕 KEEPALIVE SUAVE (30s)
       connection.pingInterval = setInterval(() => {
         if (geminiWs.readyState === WebSocket.OPEN) {
           const now = Date.now();
           connection.lastPing = now;
-
-          // Enviar ping nativo de WebSocket
           geminiWs.ping();
 
-          // Verificar si hace mucho que no recibimos respuesta
           const timeSinceLastPong = now - connection.lastPong;
           if (timeSinceLastPong > PONG_TIMEOUT) {
             console.log(
-              `⚠️ Sin respuesta de Gemini por ${Math.round(
+              `⚠️ Sin pong por ${Math.round(
                 timeSinceLastPong / 1000
-              )}s, forzando reconexión...`
+              )}s - Reconectando...`
             );
             geminiWs.close(1000, "Ping timeout");
-          } else {
-            console.log(
-              `💓 Ping enviado (último pong hace ${Math.round(
-                timeSinceLastPong / 1000
-              )}s)`
-            );
           }
         }
       }, PING_INTERVAL);
+
+      // 🆕 REFRESH PROACTIVO DE CONEXIÓN (9 minutos)
+      // Google cierra conexiones a los ~10 min, nosotros refrescamos a los 9
+      connection.connectionRefreshTimer = setTimeout(() => {
+        if (
+          geminiWs.readyState === WebSocket.OPEN &&
+          connection.shouldReconnect &&
+          !connection.isVoiceChanging
+        ) {
+          console.log(
+            "🔄 Refrescando conexión proactivamente (límite de 10 min)..."
+          );
+          geminiWs.close(1000, "Proactive connection refresh");
+        }
+      }, CONNECTION_REFRESH_TIME);
     }
 
     if (clientWs.readyState === WebSocket.OPEN) {
@@ -226,31 +271,45 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
           type: "ready",
           historyRestored: conversationLog.length > 0,
           reconnectCount: connectionData.reconnectCount,
-          currentVoice: currentVoice, // 🎵 Informar voz actual
+          currentVoice: currentVoice,
+          sessionResumptionEnabled: true,
         })
       );
     }
   });
 
-  // Manejar pong de Gemini
   geminiWs.on("pong", () => {
     const connection = clientConnections.get(clientWs);
     if (connection) {
       connection.lastPong = Date.now();
-      const pingTime = connection.lastPong - connection.lastPing;
-      console.log(`💚 Pong recibido (latencia: ${pingTime}ms)`);
+      connection.lastActivity = Date.now();
     }
   });
 
-  // Reenviar mensajes de Gemini al cliente Unity
   geminiWs.on("message", (data) => {
     try {
       const message = JSON.parse(data.toString());
       const connection = clientConnections.get(clientWs);
 
       if (!connection) return;
+      connection.lastActivity = Date.now();
 
-      // Capturar transcripciones de texto del asistente
+      // 🆕 CAPTURAR SESSION RESUMPTION HANDLE
+      if (message.sessionResumptionUpdate) {
+        const update = message.sessionResumptionUpdate;
+        if (update.resumable && update.newHandle) {
+          connection.resumptionHandle = update.newHandle;
+          console.log("🔑 Session resumption handle actualizado");
+        }
+      }
+
+      // 🆕 DETECTAR GOAWAY (advertencia de cierre inminente)
+      if (message.goAway) {
+        const timeLeft = message.goAway.timeLeft;
+        console.log(`⏰ GoAway recibido: conexión se cerrará en ${timeLeft}`);
+        // El servidor cerrará pronto, dejar que ocurra y usar resumption
+      }
+
       if (message.serverContent) {
         if (message.serverContent.modelTurn) {
           const parts = message.serverContent.modelTurn.parts || [];
@@ -258,7 +317,6 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
             if (part.text) {
               connection.currentAssistantText += part.text;
             }
-            // También intentar capturar de inlineData si existe
             if (
               part.inlineData?.mimeType === "text/plain" &&
               part.inlineData?.data
@@ -269,14 +327,11 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
                   "base64"
                 ).toString("utf-8");
                 connection.currentAssistantText += decoded;
-              } catch (e) {
-                // Ignorar errores de decodificación
-              }
+              } catch (e) {}
             }
           });
         }
 
-        // Cuando termina el turno del modelo, guardar en historial
         if (message.serverContent.turnComplete) {
           if (connection.currentAssistantText.trim()) {
             const assistantText = connection.currentAssistantText.trim();
@@ -286,80 +341,160 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
               timestamp: Date.now(),
             });
             console.log(
-              `💬 Asistente: "${assistantText.substring(0, 80)}${
-                assistantText.length > 80 ? "..." : ""
+              `💬 Asistente: "${assistantText.substring(0, 60)}${
+                assistantText.length > 60 ? "..." : ""
               }"`
             );
             connection.currentAssistantText = "";
 
-            // Limitar historial a últimos 30 mensajes (~15 turnos)
-            if (connection.conversationLog.length > 30) {
+            // Mantener últimos 40 mensajes (~20 turnos)
+            if (connection.conversationLog.length > 40) {
               const removed = connection.conversationLog.splice(
                 0,
-                connection.conversationLog.length - 30
+                connection.conversationLog.length - 40
               );
               console.log(
-                `🗑️ Historial recortado: eliminados ${removed.length} mensajes antiguos`
+                `🗑️ Historial: eliminados ${removed.length} msgs antiguos`
               );
             }
           }
         }
       }
 
-      // Enviar mensaje completo a Unity
       if (clientWs.readyState === WebSocket.OPEN) {
         clientWs.send(
           JSON.stringify({ type: "gemini_response", data: message })
         );
       }
     } catch (error) {
-      console.error("❌ Error procesando mensaje de Gemini:", error);
+      console.error("❌ Error procesando mensaje:", error);
     }
   });
 
-  // Manejar cierre de Gemini y reconectar
+  // 🆕 MANEJO DE CIERRE INTELIGENTE
   geminiWs.on("close", (code, reason) => {
-    console.log(`🔌 Gemini desconectado: ${code} - ${reason || "sin razón"}`);
+    const codeInfo = getCloseCodeInfo(code);
+    console.log(
+      `🔌 Gemini desconectado: ${code} (${codeInfo}) - ${reason || "sin razón"}`
+    );
+
     const connection = clientConnections.get(clientWs);
 
-    if (connection && connection.pingInterval) {
-      clearInterval(connection.pingInterval);
-      connection.pingInterval = null;
+    if (connection) {
+      if (connection.pingInterval) {
+        clearInterval(connection.pingInterval);
+        connection.pingInterval = null;
+      }
+      if (connection.connectionRefreshTimer) {
+        clearTimeout(connection.connectionRefreshTimer);
+        connection.connectionRefreshTimer = null;
+      }
     }
 
-    if (connection && clientWs.readyState === WebSocket.OPEN) {
-      console.log("🔄 Programando reconexión en 3 segundos...");
-      clientWs.send(
-        JSON.stringify({
-          type: "reconnecting",
-          message: `Reconectando a Gemini... (intento ${
-            connection.reconnectCount + 1
-          })`,
-          reconnectCount: connection.reconnectCount,
-        })
+    // 🆕 LÓGICA DE RECONEXIÓN MEJORADA
+    if (
+      connection &&
+      connection.shouldReconnect &&
+      clientWs.readyState === WebSocket.OPEN
+    ) {
+      const connectionDuration = Date.now() - connection.connectionStartTime;
+      const timeSinceActivity = Date.now() - connection.lastActivity;
+
+      // No reconectar solo si hay MUCHA inactividad (>10 minutos)
+      // o errores fatales
+      const isPermanentError = [1008, 1003].includes(code);
+      const tooMuchInactivity = timeSinceActivity > 600000; // 10 minutos
+
+      if (
+        connection.reconnectCount >= MAX_RECONNECT_ATTEMPTS ||
+        isPermanentError ||
+        tooMuchInactivity
+      ) {
+        const errorMsg = isPermanentError
+          ? "Error permanente de API"
+          : tooMuchInactivity
+          ? "Inactividad prolongada (>10 min)"
+          : `Demasiados intentos (${connection.reconnectCount})`;
+
+        console.log(`⛔ No se reconectará: ${errorMsg}`);
+
+        if (clientWs.readyState === WebSocket.OPEN) {
+          clientWs.send(
+            JSON.stringify({
+              type: "session_expired",
+              message:
+                "Sesión finalizada. Recarga la aplicación para continuar.",
+            })
+          );
+        }
+        return;
+      }
+
+      // Reconexión normal o cambio de voz
+      const isProactiveRefresh = reason === "Proactive connection refresh";
+      const isVoiceChange = reason === "Voice change requested";
+
+      console.log(
+        `🔄 Reconectando en ${RECONNECT_DELAY / 1000}s (intento ${
+          connection.reconnectCount + 1
+        }/${MAX_RECONNECT_ATTEMPTS})...`
       );
 
+      if (!isVoiceChange) {
+        clientWs.send(
+          JSON.stringify({
+            type: "reconnecting",
+            message: isProactiveRefresh
+              ? "Refrescando conexión (mantenimiento automático)..."
+              : `Reconectando... (${
+                  connection.reconnectCount + 1
+                }/${MAX_RECONNECT_ATTEMPTS})`,
+            reconnectCount: connection.reconnectCount,
+            reason: reason || "unknown",
+          })
+        );
+      }
+
       connection.reconnectTimeout = setTimeout(async () => {
-        console.log("🔄 Iniciando reconexión...");
+        console.log(
+          `🔄 Iniciando reconexión ${
+            connection.resumptionHandle
+              ? "CON session resumption"
+              : "sin resumption"
+          }`
+        );
+
         try {
-          await setupGeminiConnection(clientWs, true); // Intentar con OAuth primero
+          // 🆕 USAR RESUMPTION HANDLE SI ESTÁ DISPONIBLE
+          await setupGeminiConnection(
+            clientWs,
+            true,
+            isProactiveRefresh
+              ? "proactive-refresh"
+              : isVoiceChange
+              ? "voice-change"
+              : "auto-reconnect",
+            connection.resumptionHandle
+          );
         } catch (error) {
           console.error("❌ Error en reconexión:", error);
-          // Intentar una vez más con API Key
-          setTimeout(() => setupGeminiConnection(clientWs, false), 2000);
+          // Retry sin resumption como fallback
+          setTimeout(
+            () => setupGeminiConnection(clientWs, false, "fallback", null),
+            1000
+          );
         }
-      }, 3000);
+      }, RECONNECT_DELAY);
     }
   });
 
-  // Manejar errores
   geminiWs.on("error", (error) => {
-    console.error("❌ Error en conexión con Gemini:", error.message);
+    console.error("❌ Error en Gemini:", error.message);
     if (clientWs.readyState === WebSocket.OPEN) {
       clientWs.send(
         JSON.stringify({
           type: "error",
-          message: `Error en conexión con Gemini: ${error.message}`,
+          message: `Error: ${error.message}`,
         })
       );
     }
@@ -368,15 +503,14 @@ async function setupGeminiConnection(clientWs, useEphemeralToken = true) {
   return geminiWs;
 }
 
-// Conexión del cliente Unity
 wss.on("connection", async (clientWs) => {
   console.log("👤 Cliente Unity conectado");
 
   try {
-    await setupGeminiConnection(clientWs, true); // Intentar OAuth primero
+    await setupGeminiConnection(clientWs, true, "initial", null);
   } catch (error) {
     console.error("❌ Error en conexión inicial:", error);
-    await setupGeminiConnection(clientWs, false); // Fallback a API Key
+    await setupGeminiConnection(clientWs, false, "fallback", null);
   }
 
   clientWs.on("message", (message) => {
@@ -385,11 +519,12 @@ wss.on("connection", async (clientWs) => {
       const connection = clientConnections.get(clientWs);
       if (!connection || !connection.gemini) return;
 
+      connection.lastActivity = Date.now();
+
       const geminiWs = connection.gemini;
 
       if (data.type === "audio_chunk") {
         if (geminiWs.readyState === WebSocket.OPEN) {
-          // Guardar audio para posible transcripción futura
           connection.audioBuffers.push(data.audio);
 
           geminiWs.send(
@@ -409,7 +544,6 @@ wss.on("connection", async (clientWs) => {
         if (geminiWs.readyState === WebSocket.OPEN) {
           geminiWs.send(JSON.stringify({ realtime_input: {} }));
 
-          // Guardar texto del usuario si existe
           if (connection.currentUserText.trim()) {
             const userText = connection.currentUserText.trim();
             connection.conversationLog.push({
@@ -418,14 +552,13 @@ wss.on("connection", async (clientWs) => {
               timestamp: Date.now(),
             });
             console.log(
-              `💬 Usuario: "${userText.substring(0, 80)}${
-                userText.length > 80 ? "..." : ""
+              `💬 Usuario: "${userText.substring(0, 60)}${
+                userText.length > 60 ? "..." : ""
               }"`
             );
             connection.currentUserText = "";
           }
 
-          // Limpiar buffers de audio
           connection.audioBuffers = [];
         }
       } else if (data.type === "interrupt") {
@@ -433,46 +566,53 @@ wss.on("connection", async (clientWs) => {
           geminiWs.send(JSON.stringify({ interrupt: {} }));
         }
       } else if (data.type === "change_voice") {
-        // 🎵 NUEVO: Manejar cambio de voz
         const newVoice = data.voice;
         if (newVoice) {
-          console.log(`🎵 Solicitud de cambio de voz a: ${newVoice}`);
+          console.log(`🎵 Cambio de voz solicitado: ${newVoice}`);
           connection.currentVoice = newVoice;
+          connection.isVoiceChanging = true;
+          connection.shouldReconnect = true;
 
-          // Forzar reconexión con la nueva voz
+          // Limpiar resumption handle (nueva voz = nueva configuración)
+          connection.resumptionHandle = null;
+
           if (geminiWs.readyState === WebSocket.OPEN) {
-            console.log(
-              `🎵 Cerrando conexión actual para aplicar nueva voz...`
-            );
+            console.log(`🎵 Reconectando para aplicar voz: ${newVoice}`);
             geminiWs.close(1000, "Voice change requested");
           }
 
-          // Enviar confirmación al cliente
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(
               JSON.stringify({
-                type: "voice_changed",
+                type: "voice_changing",
                 voice: newVoice,
-                message: `Cambiando voz a ${newVoice}...`,
+                message: `Cambiando a voz ${newVoice}...`,
               })
             );
           }
+
+          // Reset flag después de un momento
+          setTimeout(() => {
+            if (connection) connection.isVoiceChanging = false;
+          }, 5000);
         }
       } else if (data.type === "clear_history") {
         connection.conversationLog = [];
         connection.currentUserText = "";
         connection.currentAssistantText = "";
         connection.audioBuffers = [];
-        console.log("🗑️ Historial limpiado manualmente");
+        connection.resumptionHandle = null; // Limpiar también el handle
+        console.log("🗑️ Historial y sesión limpiados");
         if (clientWs.readyState === WebSocket.OPEN) {
           clientWs.send(JSON.stringify({ type: "history_cleared" }));
         }
       } else if (data.type === "user_transcript") {
-        // Unity puede enviar transcripciones manuales
         if (data.text) {
           connection.currentUserText += " " + data.text;
-          console.log(`📝 Transcripción recibida: "${data.text}"`);
+          console.log(`📝 Transcripción: "${data.text}"`);
         }
+      } else if (data.type === "keep_alive") {
+        connection.lastActivity = Date.now();
       }
     } catch (error) {
       console.error("❌ Error procesando mensaje del cliente:", error);
@@ -483,25 +623,28 @@ wss.on("connection", async (clientWs) => {
     console.log("👋 Cliente Unity desconectado");
     const connection = clientConnections.get(clientWs);
     if (connection) {
+      connection.shouldReconnect = false;
+
       if (connection.reconnectTimeout)
         clearTimeout(connection.reconnectTimeout);
       if (connection.pingInterval) clearInterval(connection.pingInterval);
+      if (connection.connectionRefreshTimer)
+        clearTimeout(connection.connectionRefreshTimer);
       if (
         connection.gemini &&
         connection.gemini.readyState === WebSocket.OPEN
       ) {
-        connection.gemini.close();
+        connection.gemini.close(1000, "Client disconnected");
       }
       clientConnections.delete(clientWs);
     }
   });
 
   clientWs.on("error", (error) => {
-    console.error("❌ Error en conexión con cliente:", error.message);
+    console.error("❌ Error con cliente:", error.message);
   });
 });
 
-// Endpoint de salud con info detallada de historial
 app.get("/health", (req, res) => {
   const connectionsInfo = [];
   clientConnections.forEach((conn) => {
@@ -509,14 +652,21 @@ app.get("/health", (req, res) => {
       (acc, msg) => acc + msg.text.length,
       0
     );
+    const sessionDuration = Date.now() - conn.sessionStartTime;
+    const connectionDuration = Date.now() - conn.connectionStartTime;
+    const timeSinceActivity = Date.now() - conn.lastActivity;
+
     connectionsInfo.push({
       messagesInHistory: conn.conversationLog.length,
       historySizeChars: historySize,
       reconnectCount: conn.reconnectCount,
-      currentVoice: conn.currentVoice, // 🎵 Mostrar voz actual
-      lastPong: new Date(conn.lastPong).toISOString(),
-      timeSinceLastPong: Math.round((Date.now() - conn.lastPong) / 1000) + "s",
+      currentVoice: conn.currentVoice,
+      sessionDurationMins: Math.round(sessionDuration / 60000),
+      connectionDurationMins: Math.round(connectionDuration / 60000),
+      timeSinceActivitySecs: Math.round(timeSinceActivity / 1000),
       geminiConnected: conn.gemini?.readyState === WebSocket.OPEN,
+      hasResumptionHandle: !!conn.resumptionHandle,
+      shouldReconnect: conn.shouldReconnect,
     });
   });
 
@@ -524,14 +674,13 @@ app.get("/health", (req, res) => {
     status: "ok",
     connections: clientConnections.size,
     connectionsInfo,
-    uptime: Math.round(process.uptime()) + "s",
-    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB",
+    uptimeHours: Math.round(process.uptime() / 3600),
+    memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
   });
 });
 
-// ✅ NUEVO ENDPOINT raíz
 app.get("/", (req, res) => {
-  res.status(200).send("🟢 Servidor activo y listo para WebSocket");
+  res.status(200).send("🟢 Servidor con Sesiones Ilimitadas activo");
 });
 
 server.listen(PORT, () => {
@@ -539,20 +688,26 @@ server.listen(PORT, () => {
     process.env.RENDER_EXTERNAL_URL || "https://backendt-isi3.onrender.com";
   const wsUrl = renderUrl.replace("https://", "wss://");
 
-  console.log(`🚀 Servidor WebSocket corriendo en puerto ${PORT}`);
-  console.log(`📡 Conectar Unity a: ${wsUrl}`);
-  console.log(`🩺 Health check: ${renderUrl}/health`);
+  console.log(`🚀 Servidor WebSocket con Session Resumption`);
+  console.log(`📡 URL: ${wsUrl}`);
+  console.log(`🩺 Health: ${renderUrl}/health`);
+  console.log(`⏰ Refresh automático cada 9 minutos`);
+  console.log(`🔄 Session Resumption habilitado`);
+  console.log(`🗜️ Context Compression habilitado`);
 });
 
 process.on("SIGINT", () => {
   console.log("\n🛑 Cerrando servidor...");
   clientConnections.forEach((connection) => {
+    connection.shouldReconnect = false;
     if (connection.reconnectTimeout) clearTimeout(connection.reconnectTimeout);
     if (connection.pingInterval) clearInterval(connection.pingInterval);
+    if (connection.connectionRefreshTimer)
+      clearTimeout(connection.connectionRefreshTimer);
     if (connection.gemini) connection.gemini.close();
   });
   server.close(() => {
-    console.log("✅ Servidor cerrado correctamente");
+    console.log("✅ Servidor cerrado");
     process.exit(0);
   });
 });
