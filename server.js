@@ -115,11 +115,25 @@ async function setupGeminiConnection(clientWs, userName) {
             },
           },
         },
+        realtime_input_config: {
+          automatic_activity_detection: {
+            disabled: false, // TRUE = lo desactiva, FALSE = auto-VAD activo
+            start_of_speech_sensitivity: "START_SENSITIVITY_HIGH",
+            end_of_speech_sensitivity: "END_SENSITIVITY_HIGH",
+            prefix_padding_ms: 250,
+            silence_duration_ms: 400,
+          },
+        },
         system_instruction: {
-          parts: [{ text: systemText }],
+          parts: [
+            {
+              text: `Eres un asistente amigable que responde en español de forma natural. El usuario se llama ${userName}.`,
+            },
+          ],
         },
       },
     };
+
     geminiWs.send(JSON.stringify(setupMessage));
     console.log(`🎵 [${userName}] Voz configurada: ${currentVoice}`);
 
