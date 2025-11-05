@@ -3,13 +3,7 @@ const WebSocket = require("ws");
 const http = require("http");
 const cors = require("cors");
 const { GoogleAuth } = require("google-auth-library");
-const path = require("path");
 require("dotenv").config();
-
-process.env.GOOGLE_APPLICATION_CREDENTIALS = path.join(
-  __dirname,
-  "credentials.json"
-);
 
 const app = express();
 app.use(cors());
@@ -18,7 +12,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on("upgrade", (request, socket, head) => {
-  console.log("🔌 Solicitud de upgrade recibida (WebSocket)");
+  console.log("📌 Solicitud de upgrade recibida (WebSocket)");
   wss.handleUpgrade(request, socket, head, (ws) => {
     wss.emit("connection", ws, request);
   });
@@ -30,13 +24,38 @@ const MAX_CONNECTION_TIME = 13 * 60 * 1000;
 const INACTIVITY_THRESHOLD = 3 * 60 * 1000;
 const INACTIVITY_CHECK_INTERVAL = 30 * 1000;
 
+// 🔥 NUEVO: Pool de tokens para reutilizar
+let cachedToken = null;
+let tokenExpiry = 0;
+
+// 🔥 Mapa de conexiones por cliente (no por usuario)
 const clientConnections = new Map();
 
+// 🔥 NUEVO: Función mejorada con caché de tokens
 async function getEphemeralToken() {
   try {
+    // Reutilizar token si aún es válido (expires en ~3600s)
+    if (cachedToken && Date.now() < tokenExpiry - 60000) {
+      console.log("♻️ Reutilizando token en caché");
+      return cachedToken;
+    }
+
+    // 🔥 VERIFICAR QUE LAS CREDENCIALES EXISTAN
+    const credentialsJson = process.env.GOOGLE_CREDENTIALS_JSON;
+
+    if (!credentialsJson) {
+      console.error(
+        "❌ GOOGLE_CREDENTIALS_JSON no está configurado en variables de entorno"
+      );
+      return null;
+    }
+
+    // Parsear las credenciales desde la variable de entorno
+    const credentials = JSON.parse(credentialsJson);
+
     const auth = new GoogleAuth({
+      credentials: credentials,
       scopes: ["https://www.googleapis.com/auth/cloud-platform"],
-      keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS,
     });
 
     const client = await auth.getClient();
@@ -46,7 +65,11 @@ async function getEphemeralToken() {
       throw new Error("No se pudo obtener token");
     }
 
-    return accessToken.token;
+    cachedToken = accessToken.token;
+    tokenExpiry = Date.now() + 3500000; // ~58 minutos
+
+    console.log("✅ Nuevo token obtenido y cacheado");
+    return cachedToken;
   } catch (error) {
     console.error("❌ Error obteniendo token efímero:", error.message);
     return null;
@@ -72,9 +95,10 @@ async function createGeminiConnection(useEphemeralToken = true) {
     }
   }
 
+  // Fallback a API Key
   const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
   if (!GEMINI_API_KEY) {
-    throw new Error("No hay GEMINI_API_KEY ni credentials.json válidos");
+    throw new Error("No hay GEMINI_API_KEY ni credenciales válidas");
   }
 
   geminiUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
@@ -98,7 +122,7 @@ function startInactivityCheck(clientWs) {
 
     if (timeSinceLastInteraction >= INACTIVITY_THRESHOLD) {
       console.log(
-        `⏱️ INACTIVIDAD DETECTADA: ${Math.round(
+        `⏱️ INACTIVIDAD DETECTADA [${conn.userName}]: ${Math.round(
           timeSinceLastInteraction / 1000
         )}s sin interacción`
       );
@@ -106,7 +130,7 @@ function startInactivityCheck(clientWs) {
       conn.hasHadInteraction = false;
 
       if (conn.gemini && conn.gemini.readyState === WebSocket.OPEN) {
-        console.log("🔌 Cerrando Gemini por inactividad...");
+        console.log(`📌 Cerrando Gemini por inactividad [${conn.userName}]`);
         conn.gemini.close(1000, "Inactivity timeout");
       }
     }
@@ -118,7 +142,7 @@ async function setupGeminiConnection(
   userName,
   useEphemeralToken = true
 ) {
-  console.log(`🔗 Iniciando conexión a Gemini para usuario: ${userName}`);
+  console.log(`🔗 Iniciando conexión a Gemini para: ${userName}`);
 
   const geminiWs = await createGeminiConnection(useEphemeralToken);
 
@@ -139,7 +163,10 @@ async function setupGeminiConnection(
       ? existingConnection.currentVoice
       : "Zephyr",
     isChangingVoice: false,
-    userName: userName, // 🔥 GUARDAR NOMBRE
+    userName: userName,
+    clientId: existingConnection
+      ? existingConnection.clientId
+      : generateClientId(),
   };
 
   clientConnections.set(clientWs, connectionData);
@@ -148,12 +175,11 @@ async function setupGeminiConnection(
 
   geminiWs.on("open", () => {
     console.log(
-      `🎯 Conectado a Gemini API para ${userName} (reconexión #${connectionData.reconnectCount})`
+      `🎯 [${userName}] Conectado a Gemini (reconexión #${connectionData.reconnectCount})`
     );
 
     const currentVoice = connectionData.currentVoice || "Zephyr";
 
-    // 🔥 SYSTEM INSTRUCTION CON NOMBRE
     let systemText =
       "Eres un asistente amigable que responde en español de forma clara y concisa. ";
     systemText += `El usuario se llama ${userName}. Úsalo naturalmente en la conversación cuando sea apropiado.`;
@@ -176,8 +202,7 @@ async function setupGeminiConnection(
     };
 
     geminiWs.send(JSON.stringify(setupMessage));
-    console.log(`🎵 Voz configurada: ${currentVoice}`);
-    console.log(`👤 Sistema configurado para: ${userName}`);
+    console.log(`🎵 [${userName}] Voz configurada: ${currentVoice}`);
 
     const connection = clientConnections.get(clientWs);
     if (connection) {
@@ -187,21 +212,13 @@ async function setupGeminiConnection(
 
       connection.connectionTimer = setTimeout(() => {
         console.log(
-          `⏱️ Límite de tiempo alcanzado (${
-            MAX_CONNECTION_TIME / 60000
-          } min), programando reconexión...`
+          `⏱️ [${userName}] Límite de tiempo alcanzado, programando reconexión...`
         );
 
         if (geminiWs.readyState === WebSocket.OPEN) {
           geminiWs.close(1000, "Connection time limit reached");
         }
       }, MAX_CONNECTION_TIME);
-
-      console.log(
-        `⏱️ Timer de conexión configurado: ${
-          MAX_CONNECTION_TIME / 60000
-        } minutos`
-      );
     }
 
     if (clientWs.readyState === WebSocket.OPEN) {
@@ -226,12 +243,14 @@ async function setupGeminiConnection(
         );
       }
     } catch (error) {
-      console.error("❌ Error procesando mensaje de Gemini:", error);
+      console.error(`❌ [${userName}] Error procesando mensaje:`, error);
     }
   });
 
   geminiWs.on("close", (code, reason) => {
-    console.log(`🔌 Gemini desconectado: ${code} - ${reason || "sin razón"}`);
+    console.log(
+      `📌 [${userName}] Gemini desconectado: ${code} - ${reason || "sin razón"}`
+    );
     const connection = clientConnections.get(clientWs);
 
     if (connection) {
@@ -251,7 +270,7 @@ async function setupGeminiConnection(
 
       if (shouldReconnect) {
         console.log(
-          `🔄 Reconectando... (última interacción hace ${Math.round(
+          `🔄 [${userName}] Reconectando... (última interacción hace ${Math.round(
             timeSinceLastInteraction / 1000
           )}s)`
         );
@@ -267,11 +286,11 @@ async function setupGeminiConnection(
         );
 
         connection.reconnectTimeout = setTimeout(async () => {
-          console.log("🔄 Iniciando reconexión...");
+          console.log(`🔄 [${userName}] Iniciando reconexión...`);
           try {
             await setupGeminiConnection(clientWs, connection.userName, true);
           } catch (error) {
-            console.error("❌ Error en reconexión:", error);
+            console.error(`❌ [${userName}] Error en reconexión:`, error);
             setTimeout(
               () => setupGeminiConnection(clientWs, connection.userName, false),
               2000
@@ -285,7 +304,7 @@ async function setupGeminiConnection(
           ? "sin interacción"
           : `inactividad (${Math.round(timeSinceLastInteraction / 1000)}s)`;
 
-        console.log(`⏸️ NO se reconectará: ${reason}`);
+        console.log(`⏸️ [${userName}] NO se reconectará: ${reason}`);
 
         clientWs.send(
           JSON.stringify({
@@ -299,7 +318,7 @@ async function setupGeminiConnection(
   });
 
   geminiWs.on("error", (error) => {
-    console.error("❌ Error en conexión con Gemini:", error.message);
+    console.error(`❌ [${userName}] Error con Gemini:`, error.message);
     if (clientWs.readyState === WebSocket.OPEN) {
       clientWs.send(
         JSON.stringify({
@@ -313,12 +332,17 @@ async function setupGeminiConnection(
   return geminiWs;
 }
 
-wss.on("connection", async (clientWs) => {
-  console.log("📱 Cliente Unity conectado - Esperando nombre de usuario...");
+// 🔥 NUEVO: Generar ID único por cliente
+function generateClientId() {
+  return `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
 
-  // 🔥 NO CONECTAR A GEMINI TODAVÍA - Solo crear entrada en el mapa
+wss.on("connection", async (clientWs) => {
+  const clientId = generateClientId();
+  console.log(`📱 Cliente conectado [${clientId}] - Esperando nombre...`);
+
   const connectionData = {
-    gemini: null, // Sin conexión todavía
+    gemini: null,
     reconnectTimeout: null,
     connectionTimer: null,
     inactivityCheckInterval: null,
@@ -328,17 +352,19 @@ wss.on("connection", async (clientWs) => {
     audioBuffers: [],
     currentVoice: "Zephyr",
     isChangingVoice: false,
-    userName: null, // Sin nombre todavía
+    userName: null,
+    clientId: clientId,
+    connectedAt: new Date().toISOString(),
   };
 
   clientConnections.set(clientWs, connectionData);
 
-  // 🔥 ENVIAR MENSAJE INDICANDO QUE ESTÁ ESPERANDO NOMBRE
   if (clientWs.readyState === WebSocket.OPEN) {
     clientWs.send(
       JSON.stringify({
         type: "waiting_for_name",
         message: "Esperando nombre de usuario para conectar...",
+        clientId: clientId,
       })
     );
   }
@@ -349,33 +375,37 @@ wss.on("connection", async (clientWs) => {
       const connection = clientConnections.get(clientWs);
       if (!connection) return;
 
-      // 🔥 RECIBIR NOMBRE Y CONECTAR A GEMINI
+      // Recibir nombre y conectar
       if (data.type === "set_user_name") {
         const userName = data.name;
         if (userName && userName.trim()) {
           connection.userName = userName.trim();
-          console.log(`👤 Nombre recibido: ${connection.userName}`);
+          console.log(
+            `👤 [${clientId}] Nombre recibido: ${connection.userName}`
+          );
 
-          // 🔥 AHORA SÍ CONECTAR A GEMINI
           try {
             console.log(
-              `🚀 Conectando a Gemini con nombre: ${connection.userName}`
+              `🚀 [${clientId}] Conectando a Gemini como: ${connection.userName}`
             );
             await setupGeminiConnection(clientWs, connection.userName, true);
           } catch (error) {
-            console.error("❌ Error en conexión inicial:", error);
+            console.error(`❌ [${clientId}] Error en conexión inicial:`, error);
             await setupGeminiConnection(clientWs, connection.userName, false);
           }
         } else {
-          console.log("⚠️ Nombre vacío recibido");
+          console.log(`⚠️ [${clientId}] Nombre vacío recibido`);
         }
         return;
       }
 
-      // 🔥 VERIFICAR QUE GEMINI ESTÉ CONECTADO ANTES DE PROCESAR OTROS MENSAJES
       const geminiWs = connection.gemini;
       if (!geminiWs) {
-        console.log("⚠️ Mensaje recibido pero Gemini no está conectado aún");
+        console.log(
+          `⚠️ [${
+            connection.userName || clientId
+          }] Mensaje recibido pero Gemini no está conectado`
+        );
         return;
       }
 
@@ -414,13 +444,14 @@ wss.on("connection", async (clientWs) => {
       } else if (data.type === "change_voice") {
         const newVoice = data.voice;
         if (newVoice) {
-          console.log(`🎵 Solicitud de cambio de voz a: ${newVoice}`);
+          console.log(
+            `🎵 [${connection.userName}] Cambio de voz a: ${newVoice}`
+          );
 
           connection.currentVoice = newVoice;
           connection.isChangingVoice = true;
 
           if (geminiWs.readyState === WebSocket.OPEN) {
-            console.log(`🎵 Aplicando cambio de voz...`);
             geminiWs.close(1000, "Voice change requested");
           }
 
@@ -436,7 +467,9 @@ wss.on("connection", async (clientWs) => {
 
           setTimeout(async () => {
             connection.isChangingVoice = false;
-            console.log(`🎵 Reconectando con voz: ${newVoice}`);
+            console.log(
+              `🎵 [${connection.userName}] Reconectando con voz: ${newVoice}`
+            );
 
             try {
               await setupGeminiConnection(clientWs, connection.userName, true);
@@ -451,7 +484,10 @@ wss.on("connection", async (clientWs) => {
                 );
               }
             } catch (error) {
-              console.error("❌ Error cambiando voz:", error);
+              console.error(
+                `❌ [${connection.userName}] Error cambiando voz:`,
+                error
+              );
               setTimeout(
                 () =>
                   setupGeminiConnection(clientWs, connection.userName, false),
@@ -461,7 +497,7 @@ wss.on("connection", async (clientWs) => {
           }, 1000);
         }
       } else if (data.type === "request_reconnect") {
-        console.log("🔄 Cliente solicita reconexión manual");
+        console.log(`🔄 [${connection.userName}] Reconexión manual solicitada`);
 
         connection.hasHadInteraction = true;
         connection.lastInteractionTime = Date.now();
@@ -472,7 +508,10 @@ wss.on("connection", async (clientWs) => {
           try {
             await setupGeminiConnection(clientWs, connection.userName, true);
           } catch (error) {
-            console.error("❌ Error en reconexión manual:", error);
+            console.error(
+              `❌ [${connection.userName}] Error en reconexión manual:`,
+              error
+            );
             setTimeout(
               () => setupGeminiConnection(clientWs, connection.userName, false),
               2000
@@ -486,8 +525,10 @@ wss.on("connection", async (clientWs) => {
   });
 
   clientWs.on("close", () => {
-    console.log("🔌 Cliente Unity desconectado");
     const connection = clientConnections.get(clientWs);
+    const identifier = connection?.userName || clientId;
+    console.log(`📌 Cliente desconectado [${identifier}]`);
+
     if (connection) {
       if (connection.reconnectTimeout)
         clearTimeout(connection.reconnectTimeout);
@@ -505,7 +546,9 @@ wss.on("connection", async (clientWs) => {
   });
 
   clientWs.on("error", (error) => {
-    console.error("❌ Error en conexión con cliente:", error.message);
+    const connection = clientConnections.get(clientWs);
+    const identifier = connection?.userName || clientId;
+    console.error(`❌ [${identifier}] Error en conexión:`, error.message);
   });
 });
 
@@ -515,13 +558,15 @@ app.get("/health", (req, res) => {
     const timeSinceInteraction = Date.now() - conn.lastInteractionTime;
 
     connectionsInfo.push({
-      userName: conn.userName || "Esperando nombre",
+      clientId: conn.clientId,
+      userName: conn.userName || "Sin nombre",
       geminiConnected: conn.gemini?.readyState === WebSocket.OPEN,
       reconnectCount: conn.reconnectCount,
       currentVoice: conn.currentVoice,
       hasHadInteraction: conn.hasHadInteraction,
       lastInteraction: new Date(conn.lastInteractionTime).toISOString(),
       timeSinceInteraction: Math.round(timeSinceInteraction / 1000) + "s",
+      connectedAt: conn.connectedAt,
       willDisconnectIn: conn.hasHadInteraction
         ? Math.max(
             0,
@@ -538,6 +583,7 @@ app.get("/health", (req, res) => {
     connectionsInfo,
     uptime: Math.round(process.uptime()) + "s",
     memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB",
+    tokenCached: !!cachedToken,
     config: {
       maxConnectionTime: MAX_CONNECTION_TIME / 60000 + " min",
       inactivityThreshold: INACTIVITY_THRESHOLD / 60000 + " min",
@@ -561,6 +607,7 @@ server.listen(PORT, () => {
   console.log(
     `⏱️ Desconexión por inactividad: ${INACTIVITY_THRESHOLD / 60000} min`
   );
+  console.log(`👥 Servidor multi-usuario activo`);
 });
 
 process.on("SIGINT", () => {
